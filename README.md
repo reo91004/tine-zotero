@@ -78,6 +78,11 @@ To hide tzb's bookkeeping properties, add this line to the graph's `logseq/confi
 - **Mass deletion:** if half or more of a document's highlights (at least 3) vanish at once,
   tzb pauses that document and notifies you. After checking, run `tzb resume <name>`.
 - **Ambiguous pages:** a page with two blocks for the same highlight is left untouched.
+- **Half-deleted highlights:** Tine deletes a highlight from both the `.edn` and the page. A
+  highlight missing only from the `.edn`, for example after an older copy came back through
+  iCloud, is re-added. It is not deleted from Zotero.
+- **Edits during a sync:** tzb writes a Tine file only if it still holds exactly what the sync
+  planned from. Otherwise it retries next cycle.
 - **iCloud:** files that iCloud has not downloaded yet are skipped. A missing file is recreated,
   never read as a deletion.
 - **Stale writes:** Zotero writes are version-checked, so an item changed in Zotero meanwhile is
@@ -103,6 +108,10 @@ Config, key, state, backups and the log live in `~/Library/Application Support/t
 - Zotero notes are not synced yet.
 - Zotero 10.0.4 does not accept a preset key when creating an item. If tzb loses the answer to a
   create, the next cycle links the two copies again by page and text instead of creating a duplicate.
+- Comments with a later line shaped like `key:: value`, and tags containing a comma, `#` or
+  `[[ ]]`, are not synced: Tine's text format would change them. tzb logs a `skip`.
+- A Tine reader on another device (such as an iPad) is invisible to tzb. If it saves old state
+  that drops a highlight tzb just added, tzb treats that as a deletion. A backup is kept.
 - Restoring from `trash/` is manual.
 
 ## Development

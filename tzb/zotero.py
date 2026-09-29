@@ -49,15 +49,15 @@ class Zotero:
         return body, h
 
     def get_all(self, path):
-        """All pages of a list endpoint -> (items, Last-Modified-Version of the first page)."""
-        items, version = [], None
-        while True:
-            sep = "&" if "?" in path else "?"
-            page, h = self.get(f"{path}{sep}limit=100&start={len(items)}")
-            version = version if version is not None else int(h["Last-Modified-Version"])
-            items += page
-            if not page or len(items) >= int(h["Total-Results"]):
-                return items, version
+        """A whole list endpoint in one response -> (items, Last-Modified-Version).
+
+        Not paged: the local API sorts by dateModified, so an item edited between two pages would move to page one
+        and vanish from the result, which the sync would read as a deletion.
+        """
+        items, h = self.get(path)
+        if "Total-Results" in h and len(items) != int(h["Total-Results"]):
+            raise ZoteroError(f"GET {path}: got {len(items)} of {h['Total-Results']} items")
+        return items, int(h["Last-Modified-Version"])
 
     def library_version(self):
         return int(self.get("/items?limit=1")[1]["Last-Modified-Version"])

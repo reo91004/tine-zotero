@@ -275,6 +275,10 @@ def md_set_comment(md, uid, comment):
     return "\n".join(lines)
 
 
+def is_prop_line(line):
+    return bool(_PROP.match(line))
+
+
 def is_highlight(b):
     return b.props.get("ls-type") == "annotation" and "id" in b.props
 
