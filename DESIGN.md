@@ -40,7 +40,7 @@ PKM/pages/hls__<citekey>.md ◀─▶
 - 코드는 `tzb/` 아래 `zotero.py`(Local API), `tine.py`(edn/md 읽기와 부분 패치, 열린 PDF 판별), `geometry.py`(좌표 변환), `bridge.py`(계획, 실행, 명령)로 나눈다.
 - 의존성은 `pymupdf`(좌표 변환, 페이지 라벨) 하나다. EDN은 Tine이 쓰는 부분집합만 읽는 작은 파서를 직접 둔다. 부분 패치를 하려면 항목마다 파일 안의 위치(span)가 필요한데, 일반 EDN 라이브러리는 이를 알려 주지 않기 때문이다. HTTP는 `urllib`로 처리한다.
 - 설정, 키, state, 백업, 로그(`tzb.log`)는 `~/Library/Application Support/tine-zotero/`에 둔다(`TZB_HOME`으로 바꿀 수 있다). 새 페이지 맨 위의 메모 블록 글자는 `tzb init --notes-heading`으로 정한다.
-- 변경 감지는 폴링 대신 kqueue(표준 라이브러리 `select`)로 한다. 감시 대상은 graph의 `assets/`와 `pages/` 폴더, 각 `.edn`과 `hls__` 페이지, Tine 세션 파일, Zotero의 `zotero.sqlite`와 `zotero.sqlite-wal`이다. Zotero는 WAL 모드라 쓰기마다 `-wal`이 바뀐다. 이벤트가 오면 Zotero `Last-Modified-Version`과 Tine 파일 mtime으로 된 지문을 비교하고, 달라졌을 때만 동기화한다. 할 일이 남아 있으면(PDF 열림, 편집 직후, 실패) 3초 뒤 다시 보고, 없으면 10분 안전 타이머까지 잠든다.
+- 변경 감지는 폴링 대신 kqueue(표준 라이브러리 `select`)로 한다. 감시 대상은 graph의 `assets/`와 `pages/` 폴더, 각 `.edn`과 `hls__` 페이지, Tine 세션 파일, Zotero의 `zotero.sqlite`와 `zotero.sqlite-wal`이다. Zotero는 WAL 모드라 쓰기마다 `-wal`이 바뀐다. 이벤트가 오면 Zotero `Last-Modified-Version`과 Tine 파일 mtime으로 된 지문을 비교하고, 달라졌을 때만 동기화한다. 할 일이 남아 있으면(PDF 열림, 편집 직후, 412) 3초 뒤 다시 보고, 없으면 10분 안전 타이머까지 잠든다. Zotero가 꺼져 있거나 같은 오류가 반복되면 로그에 한 번만 남기고 60초 타이머와 파일 이벤트만 기다린다(v0.1.1). Zotero는 켜질 때 DB 파일을 쓰므로 그 이벤트로 곧바로 깬다. 닫힌 포트로 시험했을 때 12초 동안 로그는 1줄, CPU 증가는 0.00초였고, 연결되자 곧바로 동기화하고 `Zotero is back`을 남겼다.
 - `tzb install-agent`가 `tzb run`을 launchd 에이전트(`io.github.tine-zotero`, `ProcessType: Background`)로 등록한다. 에이전트는 설치한 위치의 코드를 실행하므로, 코드를 고친 뒤에는 `launchctl kickstart -k gui/$(id -u)/io.github.tine-zotero`로 다시 시작해야 한다.
 - iPhone이나 iPad의 Tine에서 만든 하이라이트도 iCloud를 통해 `.edn`에 들어오므로, 이 Mac의 bridge가 Zotero로 보낸다.
 

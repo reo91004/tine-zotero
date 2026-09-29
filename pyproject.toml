@@ -1,6 +1,6 @@
 [project]
 name = "tine-zotero"
-version = "0.1.0"
+version = "0.1.1"
 description = "Two-way sync of PDF highlights between Zotero and the Tine note app"
 readme = "README.md"
 license = "AGPL-3.0-only"

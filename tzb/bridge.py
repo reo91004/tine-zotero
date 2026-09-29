@@ -680,6 +680,7 @@ def sync(dry_run=False):
 
 SESSIONS = Path.home() / "Library/Application Support/page.tine.Tine/sessions"
 IDLE_S = 600                    # safety re-check when no file event arrives at all
+TROUBLE_S = 60                  # re-check while Zotero is closed or a cycle keeps failing (file events still wake us)
 VNODE = select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
 
 
@@ -702,7 +703,7 @@ def fingerprint(graph):
 
 def cmd_run():
     """Sleep in kqueue until a watched file changes; sync only when the fingerprint moved or work is pending."""
-    graph, last, pending = Path(load_config()["graph"]), None, True
+    graph, last, pending, trouble = Path(load_config()["graph"]), None, True, None
     lock = open(APP / "run.lock", "w")      # held for the life of the process
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -722,17 +723,26 @@ def cmd_run():
             if pending or fp != last:
                 pending = sync()
                 last = fingerprint(graph)
+            if trouble:
+                log("Zotero is back" if trouble == "offline" else "sync works again")
+                trouble = None
+        # While Zotero is closed or a cycle keeps failing, report it once and wait for a file event (Zotero's
+        # database changes as soon as it starts) or TROUBLE_S, instead of retrying and logging every 3 s.
         except (urllib.error.URLError, ConnectionError) as ex:
-            log(f"Zotero not reachable ({ex}); waiting")
-            pending = True
+            if trouble != "offline":
+                log(f"Zotero not reachable ({ex}); waiting for it")
+            trouble, pending, last = "offline", False, None
         except SystemExit as ex:    # a refusal (e.g. another Zotero library): say so, retry on the next change
-            log(ex)
-            pending, last = False, fingerprint(graph)
+            if trouble != str(ex):
+                log(ex)
+            trouble, pending, last = str(ex), False, None
         except Exception:       # keep the daemon alive; the next cycle re-reads everything
-            traceback.print_exc()
-            pending = True
+            err = traceback.format_exc()
+            if trouble != err:
+                log(err.rstrip())
+            trouble, pending, last = err, False, None
         try:
-            if kq.control(None, 64, 3 if pending else IDLE_S):
+            if kq.control(None, 64, 3 if pending else TROUBLE_S if trouble else IDLE_S):
                 time.sleep(0.3)         # let a burst of writes land before looking
         finally:
             kq.close()
