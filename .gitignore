@@ -1,0 +1,5 @@
+__pycache__/
+.venv/
+*.egg-info/
+# Spike evidence holds personal notes and paper excerpts.
+spikes/evidence/
