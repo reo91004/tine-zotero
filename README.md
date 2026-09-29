@@ -26,7 +26,8 @@ alias:: <citekey>                      ← link the paper as [[<citekey>]]
 ```
 
 To clear a comment, empty its block. Deleting the comment block does not clear the Zotero
-comment: tzb puts the block back with Zotero's text.
+comment: tzb puts the block back with Zotero's text. Comments and tags are compared the way Zotero
+stores them (trimmed, Unicode-normalized), and `tags::` may be written `a, b`, `#a #b` or `[[a]] [[b]]`.
 
 ## Requirements
 
@@ -47,14 +48,14 @@ or, from a clone, `uv run tzb …`.
 ## Set up
 
 ```bash
-tzb init ~/path/to/graph --notes-heading "## Notes"   # Zotero asks you to allow tzb to write: click Allow
+tzb init ~/path/to/graph --notes-heading "## Notes"   # Zotero asks to allow writes: click Always Allow
 tzb sync --dry-run                                     # see what the first sync would do
 tzb sync                                               # first sync
 brew services start tzb                                # keep syncing in the background
 ```
 
 Without Homebrew, use `tzb install-agent` (and `tzb uninstall-agent`) instead of `brew services`.
-Run only one of them: a second `tzb run` refuses to start.
+Run only one of them: a second `tzb run`, or a manual `tzb sync` while the service runs, refuses to start.
 
 To hide tzb's bookkeeping properties, add this line to the graph's `logseq/config.edn`:
 
@@ -78,6 +79,10 @@ To hide tzb's bookkeeping properties, add this line to the graph's `logseq/confi
 - **Mass deletion:** if half or more of a document's highlights (at least 3) vanish at once,
   tzb pauses that document and notifies you. After checking, run `tzb resume <name>`.
 - **Ambiguous pages:** a page with two blocks for the same highlight is left untouched.
+- **One bad document never stops the others:** a PDF that is not on this Mac yet ("download files as
+  needed"), a damaged PDF or an unreadable Tine file is skipped and reported once; everything else syncs.
+- **Trash:** a paper in the Zotero trash keeps its Tine document; only deleting it for good marks the page
+  `zotero-missing:: true`, and a paper that comes back is picked up again.
 - **Half-deleted highlights:** Tine deletes a highlight from both the `.edn` and the page. A
   highlight missing only from the `.edn`, for example after an older copy came back through
   iCloud, is re-added. It is not deleted from Zotero.
@@ -86,7 +91,9 @@ To hide tzb's bookkeeping properties, add this line to the graph's `logseq/confi
 - **iCloud:** files that iCloud has not downloaded yet are skipped. A missing file is recreated,
   never read as a deletion.
 - **Stale writes:** Zotero writes are version-checked, so an item changed in Zotero meanwhile is
-  re-read next cycle, not overwritten.
+  re-read next cycle, not overwritten. Writes to Zotero are verified by reading them back.
+- **Conflicts:** if both sides edited a comment, Zotero is overwritten only after its text is safely in
+  the `zotero-conflict::` block, and that block is written once.
 
 ## Commands
 
@@ -94,14 +101,14 @@ To hide tzb's bookkeeping properties, add this line to the graph's `logseq/confi
 |---|---|
 | `tzb init <graph>` | set the graph, get a Zotero write key |
 | `tzb sync [--dry-run]` | one sync cycle |
-| `tzb run` | stay running; sleep until Zotero's database or a Tine file changes |
+| `tzb run` | stay running; sleep until Zotero's database or a Tine folder changes |
 | `tzb install-agent` / `uninstall-agent` | run `tzb run` at login (launchd) |
-| `tzb resume <name>` | let a paused document's mass deletion through |
+| `tzb resume <name>` | let a paused document's mass deletion through (next cycle only) |
 
 Config, key, state, backups and the log live in `~/Library/Application Support/tine-zotero/`
 (override with `TZB_HOME`).
 
-## Limits (v0.1)
+## Limits
 
 - Only text highlights sync. Underline, image (area), ink, note and text annotations stay in
   Zotero; area highlights made in Tine stay in Tine.
@@ -109,9 +116,11 @@ Config, key, state, backups and the log live in `~/Library/Application Support/t
 - Zotero 10.0.4 does not accept a preset key when creating an item. If tzb loses the answer to a
   create, the next cycle links the two copies again by page and text instead of creating a duplicate.
 - Comments with a later line shaped like `key:: value`, and tags containing a comma, `#` or
-  `[[ ]]`, are not synced: Tine's text format would change them. tzb logs a `skip`.
+  `[[ ]]`, are not synced: Tine's text format would change them. tzb logs a `skip` once.
 - A Tine reader on another device (such as an iPad) is invisible to tzb. If it saves old state
   that drops a highlight tzb just added, tzb treats that as a deletion. A backup is kept.
+- Tine and iCloud replace files when they save, which tzb notices at once. An editor that saves in place is
+  noticed within a minute.
 - Restoring from `trash/` is manual.
 
 ## Development
@@ -136,7 +145,7 @@ AGPL-3.0, because tzb uses [PyMuPDF](https://pymupdf.readthedocs.io) (AGPL-3.0).
 Zotero와 Tine 사이에서 PDF 하이라이트, comment, 색, 태그를 양방향으로 1초 안팎에 동기화합니다.
 
 1. `brew install reo91004/tap/tzb`로 설치합니다.
-2. `tzb init <graph 폴더>`를 실행하고 Zotero에서 Allow를 누릅니다.
+2. `tzb init <graph 폴더>`를 실행하고 Zotero에서 **Always Allow**를 누릅니다("Allow"는 한 번만 쓰이는 키라서 거절됩니다).
 3. `tzb sync --dry-run`으로 첫 동기화 내용을 확인합니다.
 4. `tzb sync`를 실행한 뒤 `brew services start tzb`로 백그라운드 동기화를 켭니다.
 

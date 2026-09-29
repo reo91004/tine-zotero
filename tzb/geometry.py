@@ -1,7 +1,8 @@
 """Highlight rectangles: Zotero (PDF user space) <-> Tine (pdf.js viewport at scale 1, origin top-left).
 
-M = transformation_matrix * rotation_matrix handles CropBox offsets and page rotation (checked in spike 4:
-re-extracted text similarity 1.000 / 0.997 / 0.997 against Zotero's annotationText).
+The mapping is pdf.js's viewport transform: CropBox offset, flip to a top-left origin, then page rotation. Checked
+on real highlights (spike 4: re-extracted text similarity 1.000 / 0.997 / 0.997 against Zotero's annotationText) and
+by rendering a known rectangle for every rotation with and without a CropBox offset (tests/test_geometry.py).
 """
 import re
 
@@ -9,7 +10,20 @@ import pymupdf
 
 
 def _m(page):
-    return page.transformation_matrix * page.rotation_matrix
+    """PDF user space -> pdf.js viewport at scale 1 (Tine's space): unrotated top-left space, then the page rotation.
+
+    PyMuPDF 1.28's transformation_matrix drops the CropBox offset on rotated pages, so it is read at rotation 0
+    (in memory only; the PDF is never saved).
+    """
+    rot = page.rotation
+    if not rot:
+        return page.transformation_matrix
+    page.set_rotation(0)
+    try:
+        tm = page.transformation_matrix
+    finally:
+        page.set_rotation(rot)
+    return tm * page.rotation_matrix
 
 
 def to_tine(page, rects):
@@ -49,4 +63,4 @@ def sort_index(page, page_index, text, top):
     """Zotero annotationSortIndex `PPPPP|OOOOOO|TTTTT`; the offset is where the text starts in the page text."""
     first = re.sub(r"\s+", " ", text).strip()[:30]
     offset = max(re.sub(r"\s+", " ", page.get_text()).find(first), 0)
-    return f"{page_index:05d}|{offset:06d}|{int(top):05d}"
+    return f"{page_index:05d}|{offset:06d}|{max(int(top), 0):05d}"      # Zotero rejects a negative top

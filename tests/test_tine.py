@@ -1,6 +1,6 @@
 """Self-checks for the Tine file readers and patchers. Run: uv run python tests/test_tine.py"""
 from tzb.tine import (EMPTY_EDN, edn_add, edn_entry, edn_highlights, edn_remove, edn_set_color, highlight_block,
-                      md_add_conflict, md_append, md_remove, md_set_comment, md_set_prop, page_highlights, parse_page)
+                      md_add_conflict, md_append, md_remove, md_set_comment, md_set_prop, page_highlights, parse_page, zotero_str)
 
 U1, U2, U3 = (d * 8 + "-1111-1111-1111-111111111111" for d in "123")
 
@@ -36,8 +36,8 @@ def test_md_roundtrip():
 def test_comment_text_survives_exactly():
     for c in ["one line", "  lead and trail  ", "a\n\nb", "- dash\n#tag\n  - indented dash", ""]:
         md = md_append("x:: y", highlight_block("t", 1, "red", U1, "K", [], c))
-        assert hl(md)[U1].comment == c, repr(c)
-        assert hl(md_set_comment(md, U1, c + "!"))[U1].comment == c + "!"
+        assert hl(md)[U1].comment == zotero_str(c), repr(c)             # compared the way Zotero stores it
+        assert hl(md_set_comment(md, U1, c + "!"))[U1].comment == zotero_str(c + "!")
 
 
 def test_comment_update_keeps_id_and_notes():
@@ -57,6 +57,12 @@ def test_comment_block_recreated_first():
     assert hl(md)[U1].cblock is None and hl(md)[U1].comment == ""
     md = md_set_comment(md, U1, "z")
     assert hl(md)[U1].comment == "z" and md.index("zotero:: comment") < md.index("- memo")
+
+
+def test_tags_in_logseq_forms():
+    from tzb.tine import split_tags
+    assert split_tags("a, b") == split_tags("#a #b") == split_tags("[[a]] [[b]]") == split_tags("#a, [[b]]") == {"a", "b"}
+    assert split_tags("#[[multi word]], C#/.NET") == {"multi word", "C#/.NET"} and split_tags(" café ") == {"café"}
 
 
 def test_props_and_conflict():

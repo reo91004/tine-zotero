@@ -1,7 +1,7 @@
 """Read a Tine graph: `assets/<name>.edn` highlight stores, `pages/hls__<name>.md` pages, open-PDF sessions."""
-import glob
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -12,6 +12,18 @@ _STR = re.compile(r'"((?:[^"\\]|\\.)*)"', re.S)
 _TOKEN = re.compile(r"[^\s,()\[\]{}\"]+")
 _NUM = re.compile(r"[-+]?\d+(\.\d*)?([eE][-+]?\d+)?[NM]?$")
 _CLOSE = {"(": ")", "[": "]", "{": "}", "#{": "}"}
+_CHAR = re.compile(r"\\(newline|space|tab|return|formfeed|backspace|u[0-9a-fA-F]{4}|.)", re.S)
+_CHARS = {"newline": "\n", "space": " ", "tab": "\t", "return": "\r", "formfeed": "\f", "backspace": "\b"}
+_SYMBOLIC = {"##NaN": float("nan"), "##Inf": float("inf"), "##-Inf": float("-inf")}
+
+
+def _skip(s, i):
+    """Skip whitespace, commas, comments and `#_` discarded forms."""
+    while True:
+        i = _WS.match(s, i).end()
+        if not s.startswith("#_", i):
+            return i
+        _, i = read_edn(s, i + 2)
 
 
 class Keyword(str):
@@ -23,27 +35,32 @@ def read_edn(s, i=0):
 
     Maps -> dict, vectors -> list, lists/sets -> tuple, tagged literals (#uuid "…") -> the tagged value.
     """
-    i = _WS.match(s, i).end()
+    i = _skip(s, i)
     opener = "#{" if s.startswith("#{", i) else s[i]
     if opener in _CLOSE:
         i += len(opener)
         items = []
         while True:
-            i = _WS.match(s, i).end()
+            i = _skip(s, i)
             if s[i] == _CLOSE[opener]:
                 break
             v, i = read_edn(s, i)
             items.append(v)
         i += 1
         if opener == "{":
-            return dict(zip(items[::2], items[1::2])), i
+            keys = [tuple(k) if isinstance(k, list) else k for k in items[::2]]
+            return dict(zip(keys, items[1::2])), i
         return (items if opener == "[" else tuple(items)), i
     if opener == '"':
         m = _STR.match(s, i)
         return json.JSONDecoder(strict=False).decode(f'"{m.group(1)}"'), m.end()
-    if s.startswith("#_", i):
-        _, i = read_edn(s, i + 2)
-        return read_edn(s, i)
+    if opener == "\\":
+        m = _CHAR.match(s, i)
+        c = m[1]
+        return _CHARS.get(c, chr(int(c[1:], 16)) if len(c) == 5 and c[0] == "u" else c), m.end()
+    for tok, v in _SYMBOLIC.items():
+        if s.startswith(tok, i):
+            return v, i + len(tok)
     if opener == "#":
         return read_edn(s, _TOKEN.match(s, i + 1).end())
     tok = _TOKEN.match(s, i).group()
@@ -58,16 +75,16 @@ def read_edn(s, i=0):
 
 def edn_highlights(text):
     """Return ([(entry, start, end)], index of the closing "]") for the top-level `:highlights` vector of a Tine .edn."""
-    i = _WS.match(text).end()
+    i = _skip(text, 0)
     if text[i] != "{":
         raise ValueError("Tine .edn must start with a map")
     i += 1
     while True:
-        i = _WS.match(text, i).end()
+        i = _skip(text, i)
         if text[i] == "}":
             raise ValueError("Tine .edn has no :highlights")
         k, i = read_edn(text, i)
-        i = _WS.match(text, i).end()
+        i = _skip(text, i)
         if k != ":highlights":
             _, i = read_edn(text, i)
             continue
@@ -76,7 +93,7 @@ def edn_highlights(text):
         i += 1
         out = []
         while True:
-            i = _WS.match(text, i).end()
+            i = _skip(text, i)
             if text[i] == "]":
                 return out, i
             v, j = read_edn(text, i)
@@ -130,7 +147,7 @@ def edn_set_color(text, uid, color):
 # ---------------------------------------------------------------- Markdown outline (Logseq format)
 
 _BLOCK = re.compile(r"^(\t*)-(?: (.*))?$")
-_PROP = re.compile(r"^([A-Za-z0-9_-]+):: ?(.*)$")
+_PROP = re.compile(r"^([A-Za-z0-9_-]+)::(?: (.*))?$")     # Logseq writes `key:: value`: `std::vector` is text
 
 
 @dataclass
@@ -147,11 +164,19 @@ class Block:
         return self.start + len(self.lines)
 
     @property
+    def _all_props(self):
+        """A block with no text but properties has its first property on the bullet line."""
+        return all(_PROP.match(l) for l in self.lines)
+
+    @property
     def props(self):
-        return dict(m.groups() for l in self.lines[1:] if (m := _PROP.match(l)))
+        own = self.lines if self._all_props else self.lines[1:]
+        return {m[1]: m[2] or "" for l in own if (m := _PROP.match(l))}
 
     @property
     def text(self):
+        if self._all_props:
+            return ""
         return "\n".join([self.lines[0]] + [l for l in self.lines[1:] if not _PROP.match(l)])
 
     def walk(self):
@@ -240,17 +265,19 @@ def md_remove(md, uid):
 
 def _set_prop(lines, b, key, value):
     """Set, replace or (value None) remove a property line of block `b` in `lines` (edited in place)."""
-    line = "\t" * b.depth + f"  {key}:: {value}"
-    for n in range(b.start + 1, b.end):
-        m = _PROP.match(lines[n].lstrip("\t").removeprefix("  "))
+    ind = "\t" * b.depth
+    for n, own in enumerate(b.lines):
+        m = _PROP.match(own)
         if m and m[1] == key:
-            if value is None:
-                del lines[n]
+            if n == 0:      # on the bullet line
+                lines[b.start] = f"{ind}- {key}:: {value}" if value is not None else f"{ind}-"
+            elif value is None:
+                del lines[b.start + n]
             else:
-                lines[n] = line
+                lines[b.start + n] = f"{ind}  {key}:: {value}"
             return
     if value is not None:
-        lines.insert(b.end, line)
+        lines.insert(b.end, f"{ind}  {key}:: {value}")
 
 
 def md_set_prop(md, uid, key, value):
@@ -270,8 +297,7 @@ def md_set_comment(md, uid, comment):
     if c is None:
         lines[h.block.end:h.block.end] = comment_block(h.block.depth + 1, comment)
     else:
-        props = [l for l in lines[c.start + 1:c.end] if _PROP.match(l.lstrip("\t").removeprefix("  "))]
-        lines[c.start:c.end] = _block(c.depth, comment) + props
+        lines[c.start:c.end] = _block(c.depth, comment, list(c.props.items()))
     return "\n".join(lines)
 
 
@@ -284,10 +310,13 @@ def is_highlight(b):
 
 
 def md_add_conflict(md, uid, text, stamp):
-    """Keep the Zotero side of a comment conflict as a Tine-only block after the comment block."""
+    """Keep the Zotero side of a comment conflict as a Tine-only block after the comment block (once per text)."""
     lines, h = _locate(md, uid)
+    text = text or "(empty)"
+    if any("zotero-conflict" in c.props and c.text == text for c in h.block.children):
+        return md
     at = h.cblock.stop if h.cblock else h.block.end
-    lines[at:at] = _block(h.block.depth + 1, text or "(empty)", [("zotero-conflict", stamp)])
+    lines[at:at] = _block(h.block.depth + 1, text, [("zotero-conflict", stamp)])
     return "\n".join(lines)
 
 
@@ -296,19 +325,30 @@ def md_subtree(md, uid):
     return "\n".join(lines[h.block.start:h.block.stop])
 
 
+def zotero_str(s):
+    """A string as Zotero stores it (its annotation and tag setters trim and NFC-normalize), for comparisons."""
+    return unicodedata.normalize("NFC", s.strip())
+
+
+_TAG_REF = re.compile(r"#?\[\[(.+?)\]\]|(?<![^\s,])#([^\s,#\[]+)")     # `#tag` only at a word start: C#/.NET
+
+
 def split_tags(value):
-    return {t.strip().strip("#").removeprefix("[[").removesuffix("]]").strip() for t in value.split(",")} - {""}
+    """Tags of a Logseq `tags::` value: `a, b`, `#a #b`, `[[a]] [[b]]`, or a mix."""
+    refs = [a or b for a, b in _TAG_REF.findall(value)]
+    return {zotero_str(t) for t in refs + _TAG_REF.sub(",", value).split(",")} - {""}
 
 
 def page_highlights(roots):
     """Map highlight id -> PageHighlight for every `ls-type:: annotation` block, at any depth."""
     out = {}
     for b in (x for r in roots for x in r.walk()):
-        p = b.props
-        if p.get("ls-type") != "annotation" or "id" not in p:
+        if not is_highlight(b):
             continue
+        p = b.props
         c = next((c for c in b.children if c.props.get("zotero") == "comment"), None)
-        out[p["id"]] = PageHighlight(b, p["id"], p.get("zotero-key"), split_tags(p.get("tags", "")), c, c.text if c else "")
+        out[p["id"]] = PageHighlight(b, p["id"], p.get("zotero-key"), split_tags(p.get("tags", "")), c,
+                                     zotero_str(c.text) if c else "")
     return out
 
 
@@ -320,7 +360,6 @@ def open_pdfs(graph: Path):
 
     Inactive workspaces count as open too; that only delays writes, which is the safe direction.
     """
-    base = Path.home() / "Library/Application Support/page.tine.Tine/sessions"
     found = {}
 
     def visit(x):
@@ -337,6 +376,15 @@ def open_pdfs(graph: Path):
             for v in x:
                 visit(v)
 
-    for f in glob.glob(str(base / f"{glob.escape(graph.name)}-*.json")):
-        visit(json.loads(Path(f).read_text()))
+    for f in session_files(graph):
+        visit(json.loads(f.read_text()))
     return found
+
+
+SESSIONS = Path.home() / "Library/Application Support/page.tine.Tine/sessions"
+
+
+def session_files(graph: Path):
+    """Tine's session files for this graph: `<graph>-<16 hex>.json` and `…-workspaces.json` (not `<graph>-copy-…`)."""
+    pat = re.compile(rf"{re.escape(graph.name)}-[0-9a-f]{{16}}(-workspaces)?\.json")
+    return [p for p in SESSIONS.glob("*.json") if pat.fullmatch(p.name)]

@@ -1,6 +1,6 @@
 """Live round trip against a running Zotero, on a COPY of a synced graph. Creates one throwaway annotation and
-deletes it again; other annotations are only read. Stop the login agent first (`tzb uninstall-agent`) so it
-does not pull the throwaway annotation into your real graph.
+deletes it again; other annotations are only read. Stop the background sync first (`brew services stop tzb` or
+`tzb uninstall-agent`) so it does not pull the throwaway annotation into your real graph.
 
 Run: TZB_HOME=<temp state dir> uv run python tests/live_roundtrip.py <page name with a highlight>
 where <temp state dir>/config.json names the graph copy and holds a copy of the real state.json, and
@@ -45,7 +45,7 @@ def ok(cond, what):
         raise SystemExit(1)
 
 
-n0 = len(z.get_all("/items?itemType=annotation")[0])
+n0 = len(z.get_all("/items?itemType=annotation"))
 src, _, _ = tine.edn_highlights(EDN.read_text())[0][0]
 att = next(k for k, d in json.loads((bridge.APP / "state.json").read_text())["docs"].items() if d["name"] == NAME)
 r0 = src[":position"][":rects"][0]
@@ -61,8 +61,8 @@ step("A2. settle Tine-side follow-ups")
 key = hl().zotero_key
 d = zget(key)
 ok(d["annotationColor"] == "#ff6666" and d["annotationComment"] == "" and d["parentItem"] == att, f"Zotero has {key}")
-ok(hl().cblock is not None and hl().block.depth == 1 and not tine.loose_highlights(MD.read_text()),
-   "Tine: empty comment block added, highlight moved into the section")
+ok(hl().cblock is not None and hl().block.depth == 0 and hl().zotero_key == key,
+   "Tine: zotero-key recorded and an empty comment block added")
 
 # B. comment written in Tine (two lines in the one comment block)
 edit_md(lambda md: tine.md_set_comment(md, TID, "line one\nline two"))
@@ -84,16 +84,19 @@ ok([t["tag"] for t in zget(key)["tags"]] == ["tzbtest"], "Zotero tags = tzbtest"
 ok(z.patch(key, {"annotationComment": "from zotero"}, zget(key)["version"]), "PATCH in Zotero")
 step("E. comment in Zotero")
 ok(hl().comment == "from zotero", "Tine comment = from zotero")
-edit_md(lambda md: "\n".join(md.split("\n")[:hl().block.stop] + ["\t\t- tine-only memo"] + md.split("\n")[hl().block.stop:]))
+memo = "\t" * (hl().block.depth + 1) + "- tine-only memo"
+edit_md(lambda md: "\n".join(md.split("\n")[:hl().block.stop] + [memo] + md.split("\n")[hl().block.stop:]))
 step("E2. Tine-only memo")
 ok(zget(key)["annotationComment"] == "from zotero", "memo not sent to Zotero")
 
-# F. comment block deleted in Tine -> Zotero comment cleared, empty block comes back
+# F. a deleted comment block comes back with Zotero's text (never read as "clear it"); emptying its text clears
 edit_md(lambda md: "\n".join(l for i, l in enumerate(md.split("\n")) if not hl().cblock.start <= i < hl().cblock.stop))
 step("F. comment block deleted in Tine")
-step("F2. settle")
+ok(zget(key)["annotationComment"] == "from zotero" and hl().comment == "from zotero", "block restored, Zotero kept")
+edit_md(lambda md: tine.md_set_comment(md, TID, ""))
+step("F2. comment block emptied in Tine")
 ok(zget(key)["annotationComment"] == "", "Zotero comment cleared")
-ok(hl().cblock is not None and hl().comment == "" and "- tine-only memo" in MD.read_text(), "empty block back, memo kept")
+ok(hl().cblock is not None and hl().comment == "" and "- tine-only memo" in MD.read_text(), "empty block kept, memo kept")
 
 # G. deleted in Tine -> deleted in Zotero
 EDN.write_text(tine.edn_remove(EDN.read_text(), TID))
@@ -112,12 +115,12 @@ key2 = z.create(item | {"annotationText": "tzb zotero-side test", "annotationCom
 step("H1. create in Zotero")
 tid2 = str(uuid.uuid5(bridge.NS, key2))
 e = {str(x[":id"]): x for x, _, _ in tine.edn_highlights(EDN.read_text())[0]}
-ok(hl(tid2) and hl(tid2).comment == "zc" and hl(tid2).block.depth == 1 and e[tid2][":properties"][":color"] == "purple",
-   "Tine has it in the section with comment and color")
+ok(hl(tid2) and hl(tid2).comment == "zc" and hl(tid2).block.depth == 0 and e[tid2][":properties"][":color"] == "purple",
+   "Tine has it with comment and color")
 ok(z.delete(key2, zget(key2)["version"]), "DELETE in Zotero")
 step("H2. delete in Zotero")
 ok(hl(tid2) is None and tid2 not in {str(x[":id"]) for x, _, _ in tine.edn_highlights(EDN.read_text())[0]},
    "Tine block and .edn entry removed")
 
 step("I. settle")
-ok(len(z.get_all("/items?itemType=annotation")[0]) == n0, f"Zotero back to {n0} annotations")
+ok(len(z.get_all("/items?itemType=annotation")) == n0, f"Zotero back to {n0} annotations")

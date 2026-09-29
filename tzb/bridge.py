@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import traceback
+import unicodedata
 import urllib.error
 import uuid
 from collections import Counter, defaultdict
@@ -21,7 +22,7 @@ from pathlib import Path
 import pymupdf
 
 from . import geometry, tine
-from .zotero import Zotero, ZoteroError, authorize, server_id
+from .zotero import Zotero, ZoteroAuthError, ZoteroError, authorize, server_id
 
 APP = Path(os.environ.get("TZB_HOME") or Path.home() / "Library/Application Support/tine-zotero")
 NS = uuid.UUID("5b0c6f7e-3d7a-4a53-9a57-2f3e0f6f1a10")   # Tine id of a Zotero-born highlight = uuid5(NS, key)
@@ -29,8 +30,11 @@ TINE_HEX = {"yellow": "#ffd400", "red": "#ff6666", "green": "#5fb236", "blue": "
 SF_DATALESS = 0x40000000        # st_flags bit: iCloud evicted the file's contents
 STALE_WINDOW_MS = 60_000        # a reader opened before a bridge write appears in Tine's session file well within this
 EDIT_QUIET_MS = 3_000           # no Tine writes to a page this fresh: Tine stops saving a page changed under unsaved edits
-READER_OPS = {"create_doc", "clone_pdf", "tine_add", "tine_remove", "tine_color", "zotero_gone"}  # an open reader rewrites these
-WHOLE_OPS = {"tine_add", "tine_remove", "z_create", "z_delete"}       # on failure the whole old base entry stays
+# Changes to what an open Tine reader rewrites from memory (the .edn, highlight blocks): they wait for the PDF to close.
+READER_OPS = {"create_doc", "init_files", "clone_pdf", "tine_add", "tine_remove", "tine_color"}
+PDF_OPEN = "PDF open in Tine"
+MISSING_MARK = "zotero-missing:: true"
+WHOLE_OPS = {"tine_add", "tine_remove", "z_delete"}      # on failure the whole old base entry stays
 OP_FIELDS = {"tine_color": ("color", "tine_color"), "tine_comment": ("comment",), "tine_conflict": ("comment",),
              "tine_tags": ("tags",)}
 PATCH_FIELDS = {"annotationColor": ("color", "tine_color"), "annotationComment": ("comment",), "tags": ("tags",)}
@@ -71,8 +75,8 @@ def norm(s):
 
 
 def comment_fits(text):
-    """True if the comment survives as one Logseq block: no continuation line may parse as a property."""
-    return not any(tine.is_prop_line(l) for l in text.split("\n")[1:])
+    """True if the comment survives as one Logseq block: no line of it may parse as a property."""
+    return not any(tine.is_prop_line(l) for l in text.split("\n"))
 
 
 def tags_fit(tags):
@@ -101,43 +105,68 @@ class Action:
 
 # ---------------------------------------------------------------- reading Zotero
 
+# Item JSON cached for the life of the process and refreshed by version: a full attachment list costs Zotero ~5 ms
+# of CPU per item, and `tzb run` reads the library on every change.
+_CACHE = {"attachment": {}, "annotation": {}, "parents": {}}
+
+
+def _items(z, item_type):
+    """{key: data} for all items of a type, fetching only those whose version changed since the last call."""
+    cache, vers = _CACHE[item_type], z.versions(f"/items?itemType={item_type}")
+    for k in cache.keys() - vers.keys():
+        del cache[k]
+    for item in z.by_keys([k for k, v in vers.items() if k not in cache or cache[k]["version"] != v]):
+        cache[item["key"]] = item["data"]
+    return cache
+
+
 def read_zotero(z):
-    """-> (PDF attachment data list, {top item key: data}, {attachment key: {annotation key: data}}, skipped types)."""
-    atts, _ = z.get_all("/items?itemType=attachment")
-    top, _ = z.get_all("/items/top")
-    anns, _ = z.get_all("/items?itemType=annotation")
+    """-> (PDF attachment data list, {attachment key: {annotation key: data}}, skipped annotation types)."""
     by_att, skipped = defaultdict(dict), Counter()
-    for a in anns:
-        d = unify_newlines(a["data"])
+    for d in _items(z, "annotation").values():
         if d["annotationType"] == "highlight":
-            by_att[d["parentItem"]][d["key"]] = d
+            by_att[d["parentItem"]][d["key"]] = unify_newlines(dict(d))
         else:
-            skipped[d["annotationType"]] += 1   # ponytail: underline/image/ink/note/text stay Zotero-only in v0.1
-    pdfs = [a["data"] for a in atts
-            if a["data"].get("contentType") == "application/pdf" and a["data"].get("linkMode") in ("imported_file", "imported_url")]
-    return pdfs, {i["key"]: i["data"] for i in top}, by_att, skipped
+            skipped[d["annotationType"]] += 1       # underline/image/ink/note/text stay Zotero-only (README "Limits")
+    pdfs = [d for d in _items(z, "attachment").values()
+            if d.get("contentType") == "application/pdf" and d.get("linkMode") in ("imported_file", "imported_url")]
+    return pdfs, by_att, skipped
+
+
+def parents_of(z, pdfs):
+    """{parent key: data} for the given attachments (only new documents need their citekey and title)."""
+    cache = _CACHE["parents"]
+    want = {a["parentItem"] for a in pdfs if a.get("parentItem")} - cache.keys()
+    for item in z.by_keys(want):
+        cache[item["key"]] = item["data"]
+    return cache
 
 
 def unify_newlines(d):
-    """\r\n and \r become \n in text and comment (PDF-imported notes often use \r): Tine files only know \n."""
+    """\\r\\n and \\r become \\n in text and comment (PDF-imported notes often use \\r): Tine files only know \\n."""
     for f in ("annotationText", "annotationComment"):
         d[f] = d[f].replace("\r\n", "\n").replace("\r", "\n")
     return d
 
 
 def assign_names(pdfs, parents, state):
-    """Stable Tine names: citekey (or attachment key), with -2, -3 … for further PDFs; kept in state once used."""
-    taken = {d["name"] for d in state["docs"].values()}
+    """Stable Tine names: citekey (or attachment key), with -2, -3 … for further PDFs; kept in state once used.
+
+    Unique ignoring case and Unicode normalization, as APFS file names are.
+    """
+    fold = lambda n: unicodedata.normalize("NFC", n).casefold()
+    taken = {fold(d["name"]) for d in state["docs"].values()}
     names = {k: d["name"] for k, d in state["docs"].items()}
     for a in sorted(pdfs, key=lambda a: (a["dateAdded"], a["key"])):
         if a["key"] in names:
             continue
-        base = re.sub(r"[^\w.-]", "_", parents.get(a.get("parentItem"), {}).get("citationKey") or a["key"])
+        key = parents.get(a.get("parentItem"), {}).get("citationKey") or a["key"]
+        base = re.sub(r"[^\w.-]", "_", unicodedata.normalize("NFC", key))
         name, n = base, 1
-        while name in taken:
+        while fold(name) in taken:
             n += 1
             name = f"{base}-{n}"
-        taken.add(name)
+        taken.add(fold(name))
         names[a["key"]] = name
     return names
 
@@ -145,17 +174,22 @@ def assign_names(pdfs, parents, state):
 # ---------------------------------------------------------------- planning
 
 def base_values(z, tid):
-    return {"id": tid, "version": z["version"], "comment": z["annotationComment"], "color": z["annotationColor"],
-            "tine_color": nearest(z["annotationColor"]), "tags": sorted(t["tag"] for t in z["tags"])}
+    """The synced base for Zotero item `z`: exactly what add() writes to Tine, so a comment or tags Tine cannot hold
+    are recorded as the empty values Tine actually has."""
+    tags = sorted(t["tag"] for t in z["tags"])
+    return {"id": tid, "version": z["version"], "color": z["annotationColor"], "tine_color": nearest(z["annotationColor"]),
+            "comment": z["annotationComment"] if comment_fits(z["annotationComment"]) else "",
+            "tags": tags if tags_fit(tags) else []}
 
 
-def plan_doc(graph, att, name, zanns, sdoc, views, now):
-    """Compare Zotero, Tine and the last synced base for one PDF.
+def plan_doc(graph, att, name, zanns, sdoc, views, now, allow_mass_delete=False):
+    """Compare Zotero, Tine and the last synced base for one PDF. Pure: it changes nothing.
 
-    Returns (actions, new base {Zotero key: values, or None to forget}, {"edn", "md": the texts it read}).
-    Writes later check the files against those texts, so an edit made after planning is never overwritten.
-    `views` holds the open times of Tine readers showing this PDF. A base field that is None is unknown, and the Zotero value wins it.
-    May set sdoc["stale"] and drop "undo" records; the caller saves state only after a real run.
+    Returns (actions, new base {Zotero key: values, or None to forget}, snap). snap holds the file texts it read
+    ("edn", "md"; writes later check the files against them, so an edit made after planning is never overwritten)
+    and what run_doc must record: "old_reader" (a reader opened before our last write is open) and "keep_undo".
+    `views` holds the open times of Tine readers showing this PDF. A base field that is None is unknown, and the
+    Zotero value wins it.
     """
     out, new_base, snap = [], {}, {}
 
@@ -168,46 +202,51 @@ def plan_doc(graph, att, name, zanns, sdoc, views, now):
                 for p in files if p != pdf)
 
     def act(op, zkey="", tid="", arg=None, note=""):
-        why = ("PDF open in Tine" if op in READER_OPS and views else
+        why = (PDF_OPEN if op in READER_OPS and views else
                "page edited seconds ago" if fresh and not op.startswith("z_") and op != "adopt" else "")
         out.append(Action(name, op, zkey, tid, arg, note, why))
 
-    if any(p.stat().st_flags & SF_DATALESS for p in files):
+    # An evicted PDF clone does not matter (geometry reads Zotero's own file); evicted Tine files cannot be read.
+    if any(p.stat().st_flags & SF_DATALESS for p in files if p != pdf):
         return [Action(name, "skip", note="iCloud has not downloaded these files yet")], {}, snap
+    snap["edn"] = edn_p.read_text() if edn_p.exists() else None
+    snap["md"] = md_p.read_text() if md_p.exists() else None
     if sdoc is None:
         if not files:
             act("create_doc", note=f"new: {len(zanns)} highlights")
             return out, {k: base_values(d, str(uuid.uuid5(NS, k))) for k, d in zanns.items()}, snap
-        if not (pdf.exists() and pdf.stat().st_size == att["_size"]):
+        # Our own page for a paper that left Zotero (zotero_gone removed its PDF) and is back: take it over again,
+        # but only if its highlights are this attachment's (another paper reusing the name must not wipe them).
+        keys = {h.zotero_key for h in tine.page_highlights(tine.parse_page(snap["md"] or "")[1]).values() if h.zotero_key}
+        returning = not pdf.exists() and MISSING_MARK in (snap["md"] or "") and keys <= zanns.keys()
+        if not returning and not (pdf.exists() and pdf.stat().st_size == att["_size"]):
             return [Action(name, "skip", note="name taken by a file that is not this Zotero PDF")], {}, snap
         act("adopt", note="existing Tine files: where they differ, Zotero wins")
         sdoc = {"anns": {}}
 
-    snap["edn"] = edn_p.read_text() if edn_p.exists() else None
-    snap["md"] = md_p.read_text() if md_p.exists() else None
     edn_text, md = snap["edn"] or tine.EMPTY_EDN, snap["md"] or ""
-    edn_ids = [str(e[":id"]) for e, _, _ in tine.edn_highlights(edn_text)[0]]
-    md_ids = [b.props["id"] for r in tine.parse_page(md)[1] for b in r.walk() if tine.is_highlight(b)]
+    hls, roots = tine.edn_highlights(edn_text)[0], tine.parse_page(md)[1]
+    edn_ids = [str(e[":id"]) for e, _, _ in hls]
+    md_ids = [b.props["id"] for r in roots for b in r.walk() if tine.is_highlight(b)]
     if len(edn_ids) != len(set(edn_ids)) or len(md_ids) != len(set(md_ids)):
         # Two blocks claiming one highlight (seen when a Tine reader re-created blocks it could not find):
         # which one holds the user's comment is unknowable, so write nothing on either side.
         return [Action(name, "skip", note="duplicate highlight blocks in the page or .edn: fix by hand")], {}, snap
-    entries = {str(e[":id"]): e for e, _, _ in tine.edn_highlights(edn_text)[0]}
-    page = tine.page_highlights(tine.parse_page(md)[1])
+    entries = {str(e[":id"]): e for e, _, _ in hls}
+    page = tine.page_highlights(roots)
     missing = not (edn_p.exists() and md_p.exists())
     if missing:
         act("init_files", note="Tine files missing: recreate them (never read as deletions)")
     if not pdf.exists() or pdf.stat().st_size != att["_size"]:
         act("clone_pdf", note="PDF missing or changed in Zotero")
+    if MISSING_MARK in md:
+        act("unmark_missing", note="back in Zotero")
 
     # A reader opened before our last write may still hold the old state and save it back over our write.
     written = sdoc.get("written_at")
-    if written and any(t is None or t < written for t in views):
-        sdoc["stale"] = True
-    stale = sdoc.get("stale", False)
-    if written and not stale and now - written > STALE_WINDOW_MS:
-        for b in sdoc["anns"].values():
-            b.pop("undo", None)
+    snap["old_reader"] = bool(written) and any(t is None or t < written for t in views)
+    stale = snap["old_reader"] or sdoc.get("stale", False)
+    snap["keep_undo"] = keep_undo = stale or not written or now - written <= STALE_WINDOW_MS
 
     base, lines = sdoc["anns"], md.split("\n")
     by_md_key = {h.zotero_key: i for i, h in page.items() if h.zotero_key}
@@ -236,6 +275,8 @@ def plan_doc(graph, att, name, zanns, sdoc, views, now):
             if b is None or missing or h or undo.get("present") is False or z["version"] > b["version"]:
                 act("tine_add", k, i, note=short(z["annotationText"]))
                 new_base[k] = base_values(z, i)
+                if h:   # add() keeps that block as it is: merge its comment and tags against the old base next cycle
+                    new_base[k]["comment"], new_base[k]["tags"] = (b.get("comment"), b.get("tags")) if b else (None, None)
             else:
                 tine_deleted.append(k)
                 act("z_delete", k, i, z["version"], "deleted in Tine: " + short(z["annotationText"]))
@@ -246,34 +287,52 @@ def plan_doc(graph, att, name, zanns, sdoc, views, now):
                 act("tine_remove", k, i, note="deleted in Zotero")
             new_base[k] = None
             continue
-        new_base[k] = plan_fields(act, k, i, z, b, e, h, undo)
+        # A page block lost while its .edn entry stays (page deleted or recreated, or a half-applied write) is
+        # never rewritten by Tine; add() puts it back. Not for Tine-born ids: their block may simply not be saved yet.
+        restore = h is None and (missing or i == str(uuid.uuid5(NS, k)))
+        if restore:
+            act("tine_add", k, i, note="restore the page block")
+        new_base[k] = plan_fields(act, k, i, z, b, e, h, undo, keep_undo)
+        if restore:
+            bv = base_values(z, i)
+            new_base[k]["comment"], new_base[k]["tags"] = bv["comment"], bv["tags"]
         if h:
             new_base[k]["md"] = "\n".join(lines[h.block.start:h.block.stop])
 
     paired = set(tid.values())
+    removed = sdoc.get("removed", {}) if stale else {}
     for i, e in entries.items():
         if i in paired:
             continue
         h = page.get(i)
-        text = e.get(":content", {}).get(":text")
+        content = e.get(":content", {})
+        text = content.get(":text")
         if h and h.zotero_key:      # synced once, but neither Zotero nor our state knows it any more
             act("tine_remove", h.zotero_key, i, note="deleted in Zotero")
-        elif not text:
-            out.append(Action(name, "skip", tid=i, note="area highlight: not synced in v0.1"))
+        elif i in removed:          # a reader opened before we removed it saved it back
+            act("tine_remove", tid=i, note="deleted in Zotero; an old Tine reader saved it back")
+        elif not text or text == "[:span]" or ":image" in content or (h and h.block.props.get("hl-type") == "area"):
+            out.append(Action(name, "skip", tid=i, note="area highlight: not synced"))
         else:
             act("z_create", tid=i, note="new in Tine: " + short(text))
 
-    if len(tine_deleted) >= 3 and 2 * len(tine_deleted) >= len(base) and not sdoc.get("allow_mass_delete"):
+    # Both halves of a comment conflict wait together: the Zotero text must reach the page before it is overwritten.
+    held = {a.zkey: a.deferred for a in out if a.op == "tine_conflict" and a.deferred}
+    for a in out:
+        if a.op == "z_patch" and a.zkey in held:
+            a.deferred = held[a.zkey]
+
+    if len(tine_deleted) >= 3 and 2 * len(tine_deleted) >= len(base) and not allow_mass_delete:
         return [Action(name, "pause", note=f"{len(tine_deleted)} of {len(base)} highlights vanished from Tine; "
                                            f"check, then `tzb resume {name}`")], {}, snap
     return out, new_base, snap
 
 
-def plan_fields(act, k, i, z, b, e, h, undo):
+def plan_fields(act, k, i, z, b, e, h, undo, keep_undo):
     """Three-way merge of color, comment and tags for a highlight present on both sides; returns the new base."""
     known = lambda f: b is not None and b.get(f) is not None
     patch, notes, res = {}, [], base_values(z, i)
-    if b and "undo" in b:
+    if b and "undo" in b and keep_undo:
         res["undo"] = b["undo"]
 
     zc, tc = z["annotationColor"], e.get(":properties", {}).get(":color")
@@ -286,7 +345,7 @@ def plan_fields(act, k, i, z, b, e, h, undo):
         else:       # Zotero changed, both changed, first sync, or a stale reader put the old color back
             act("tine_color", k, i, nearest(zc), f"{tc} -> {nearest(zc)}")
 
-    if h is None:       # md block not written yet (Tine or iCloud lag): comment and tags wait for a later cycle
+    if h is None:       # no page block (yet): comment and tags wait for a later cycle
         res["comment"], res["tags"] = (b.get("comment"), b.get("tags")) if b else (None, None)
         if patch:
             act("z_patch", k, i, (patch, z["version"]), "; ".join(notes))
@@ -357,19 +416,39 @@ class Files:
         return tine.page_highlights(tine.parse_page(self.md)[1])
 
     def save(self):
-        """Write changed files; returns {file name: mtime} of what was written."""
+        """Write the changed files if all of them still hold what the plan read; returns {file name: mtime} written.
+
+        Both are checked before either is replaced, and the page goes first: if the .edn moves on in between,
+        the page has the block and the next cycle re-adds the missing .edn entry.
+        """
+        current = lambda p: p.read_text() if p.exists() else None
+        todo = [(p, o, n) for p, o, n in ((self.md_p, self.md0, self.md), (self.edn_p, self.edn0, self.edn))
+                if n is not None and n != o]
+        moved = [p.name for p, o, _ in todo if current(p) != o]
+        if moved:
+            raise Changed(", ".join(moved))
         wrote = {}
-        for path, old, new in ((self.edn_p, self.edn0, self.edn), (self.md_p, self.md0, self.md)):
-            if new is None or new == old:
-                continue
+        for path, old, new in todo:
             tmp = path.with_name(f".tzb-{path.name}.tmp")
             tmp.write_text(new)
-            if (path.read_text() if path.exists() else None) != old:
+            if current(path) != old:
                 tmp.unlink()
                 raise Changed(path.name)
             os.replace(tmp, path)
             wrote[path.name] = path.stat().st_mtime
         return wrote
+
+
+class LazyPDF:
+    """Zotero's copy of the PDF, opened on first use (most cycles need no geometry)."""
+
+    def __init__(self, path):
+        self.path, self.doc = path, None
+
+    def __getitem__(self, i):
+        if self.doc is None:
+            self.doc = pymupdf.open(self.path)
+        return self.doc[i]
 
 
 def clone(src, dst):
@@ -389,30 +468,44 @@ def page_header(name, att):
     return "\n".join(lines) + "\n"
 
 
+def notify(msg):
+    subprocess.run(["osascript", "-e", "on run argv", "-e",
+                    'display notification (item 1 of argv) with title "tine-zotero"', "-e", "end run", msg],
+                   capture_output=True)
+
+
 class Sync:
     def __init__(self, graph, z, state, cfg):
         self.graph, self.z, self.state = graph, z, state
         # A block for the user's own notes above the highlights: Tine appends new highlights at the page end.
         self.notes = cfg.get("notes_heading", "## Notes")
-        self.retry = False      # something is left for the next cycle even if nothing changes
+        self.retry = None       # "soon": look again in 3 s (a page is being edited); "later": something failed
+        self.problems = {}      # message -> notify?; sync() logs a message only when it is new
 
     def save_state(self):
         save_json(APP / "state.json", self.state)
 
+    def report(self, msg, notify=False):
+        self.problems[msg] = self.problems.get(msg, False) or notify
+
+    def failed(self, soon=False):
+        self.retry = "soon" if soon or self.retry == "soon" else "later"
+
     def run_doc(self, att, name, zanns, acts, new_base, snap):
-        docs, now = self.state["docs"], time.time() * 1000
+        docs = self.state["docs"]
         for a in acts:
-            if a.op in ("skip", "pause") or a.deferred:
-                self.retry |= a.op != "skip"
-                if a.op == "pause":
-                    subprocess.run(["osascript", "-e", f'display notification "{a.note}" with title "tine-zotero"'])
+            if a.op in ("skip", "pause"):
+                self.report(str(a), notify=a.op == "pause")
+            elif a.deferred and a.deferred != PDF_OPEN:
+                self.failed(soon=True)      # the page is quiet 3 s after the last save; a closing PDF wakes us itself
         live = [a for a in acts if not a.deferred and a.op not in ("skip", "pause")]
-        if not live and not new_base:
+        if any(a.op in ("create_doc", "adopt") for a in live):
+            docs[att["key"]] = {"name": name, "src": att["_path"], "anns": {}}
+        sdoc = docs.get(att["key"])
+        if sdoc is None:            # a new document whose creation waits (its PDF shows in a Tine tab)
             return
-        before = json.dumps(docs.get(att["key"]), sort_keys=True)
-        f = Files(self.graph, name, snap)
-        pdfdoc = pymupdf.open(att["_path"]) if any(a.op in ("create_doc", "tine_add", "z_create") for a in live) else None
-        blocked = defaultdict(set)      # Zotero key -> base fields that keep their old value ("*": the whole entry)
+        before = json.dumps(sdoc, sort_keys=True)
+        blocked = defaultdict(set)  # Zotero key -> base fields that keep their old value ("*": the whole entry)
 
         def block(a):
             if a.op in WHOLE_OPS:
@@ -425,33 +518,14 @@ class Sync:
         for a in acts:
             if a.deferred:
                 block(a)
-        if any(a.op in ("create_doc", "adopt") for a in live):
-            docs[att["key"]] = {"name": name, "src": att["_path"], "anns": {}}
-        sdoc = docs[att["key"]]
+        applied = self.apply(att, name, zanns, live, new_base, snap, sdoc, block) if live else True
 
-        for a in [a for a in live if a.op.startswith("z_")]:      # Zotero first: new keys feed the Tine edits
-            try:
-                getattr(self, a.op)(att, f, pdfdoc, zanns, sdoc, new_base, a)
-                log(a)
-            except (ZoteroError, urllib.error.URLError) as ex:
-                log(f"{a}  FAILED: {ex}")
-                block(a)
-                self.retry = True
-        tine_ops = [a for a in live if not a.op.startswith("z_") and a.op != "adopt"]
-        try:
-            for a in tine_ops:
-                getattr(self, a.op)(att, f, pdfdoc, zanns, sdoc, new_base, a)
-            sdoc.setdefault("wrote", {}).update(f.save())
-            for a in tine_ops + [a for a in live if a.op == "adopt"]:
-                log(a)
-            if any(a.op in READER_OPS for a in tine_ops):
-                sdoc["written_at"], sdoc["stale"] = now, False
-        except Changed as ex:
-            log(f"{name}: {ex} changed while syncing; retrying next cycle")
-            for a in tine_ops:
-                block(a)
-            self.retry = True
-
+        if snap.get("old_reader"):
+            sdoc["stale"] = True
+        elif "old_reader" in snap and applied and not any(a.deferred for a in acts):
+            sdoc.pop("stale", None)     # the old reader is gone and what it saved is now reconciled
+        if not snap.get("keep_undo", True):
+            sdoc.pop("removed", None)
         anns = sdoc["anns"]
         for k, nb in new_base.items():
             kept = blocked.get(k, set())
@@ -460,13 +534,57 @@ class Sync:
             if nb is None:
                 anns.pop(k, None)
                 continue
-            for field in kept:
-                nb[field] = anns.get(k, {}).get(field)
+            if kept:    # a field still waits: the version must not claim Tine has seen this Zotero edit
+                nb["version"] = anns.get(k, {}).get("version", 0)
+                for field in kept:
+                    nb[field] = anns.get(k, {}).get(field)
             anns[k] = nb
-        if live:
-            sdoc.pop("allow_mass_delete", None)
         if json.dumps(sdoc, sort_keys=True) != before:
             self.save_state()
+
+    def apply(self, att, name, zanns, live, new_base, snap, sdoc, block):
+        f, pdfdoc = Files(self.graph, name, snap), LazyPDF(att["_path"])
+        # A comment conflict overwrites Zotero only after its zotero-conflict block is safely on the page.
+        late = {a.zkey for a in live if a.op == "tine_conflict"}
+        zops = [a for a in live if a.op.startswith("z_")]
+        tine_ops = [a for a in live if not a.op.startswith("z_") and a.op != "adopt"]
+        for a in zops:                              # Zotero first: new keys feed the Tine edits
+            if not (a.op == "z_patch" and a.zkey in late):
+                self.run_z(att, f, pdfdoc, zanns, sdoc, new_base, a, block)
+        try:
+            for a in tine_ops:
+                getattr(self, a.op)(att, f, pdfdoc, zanns, sdoc, new_base, a)
+            sdoc.setdefault("wrote", {}).update(f.save())
+        except Exception as ex:
+            if isinstance(ex, Changed):
+                self.report(f"{name}: {ex} changed while syncing; retrying")
+                self.failed(soon=True)
+            else:
+                self.report(f"{name}: Tine update failed: {ex!r}")
+                self.failed()
+            for a in tine_ops + [a for a in zops if a.op == "z_patch" and a.zkey in late]:
+                block(a)
+            return False
+        for a in tine_ops + [a for a in live if a.op == "adopt"]:
+            log(a)
+        if any(a.op in READER_OPS for a in tine_ops):
+            sdoc["written_at"] = time.time() * 1000     # after the write: a reader opened before it holds old files
+        for a in zops:
+            if a.op == "z_patch" and a.zkey in late:
+                self.run_z(att, f, pdfdoc, zanns, sdoc, new_base, a, block)
+        return True
+
+    def run_z(self, att, f, pdfdoc, zanns, sdoc, new_base, a, block):
+        try:
+            getattr(self, a.op)(att, f, pdfdoc, zanns, sdoc, new_base, a)
+            log(a)
+        except Exception as ex:
+            block(a)
+            if isinstance(ex, ZoteroAuthError):
+                self.report("Zotero rejected the write key: run `tzb init <graph>` and click Always Allow", True)
+            else:
+                self.report(f"{a}  FAILED: {ex!r}")
+            self.failed()
 
     # --- document operations
 
@@ -486,8 +604,11 @@ class Sync:
 
     def zotero_gone(self, att, f, pdfdoc, zanns, sdoc, new_base, a):
         f.pdf.unlink(missing_ok=True)
-        if f.md is not None and "zotero-missing::" not in f.md:
-            f.md = "zotero-missing:: true\n" + f.md
+        if f.md is not None and MISSING_MARK not in f.md:
+            f.md = MISSING_MARK + "\n" + f.md
+
+    def unmark_missing(self, att, f, pdfdoc, zanns, sdoc, new_base, a):
+        f.md = "\n".join(l for l in f.md.split("\n") if l != MISSING_MARK)
 
     def notes_block(self):
         """The user's notes heading with an empty block to type in, then a rule above the highlights."""
@@ -498,20 +619,20 @@ class Sync:
     def add(self, f, pdfdoc, z, tid):
         """Make sure the Zotero highlight `z` exists in the .edn and the page as Tine highlight `tid`."""
         pos = json.loads(z["annotationPosition"])
-        page = pdfdoc[pos["pageIndex"]]
         pg, color = pos["pageIndex"] + 1, nearest(z["annotationColor"])
         if tid not in f.entries():
-            rects, w, h = geometry.to_tine(page, pos["rects"])
+            rects, w, h = geometry.to_tine(pdfdoc[pos["pageIndex"]], pos["rects"])
             f.edn = tine.edn_add(f.edn, tine.edn_entry(tid, pg, rects, w, h, z["annotationText"], color))
         if tid not in f.highlights():
-            tags = sorted(t["tag"] for t in z["tags"])
-            f.md = tine.md_append(f.md, tine.highlight_block(
-                z["annotationText"], pg, color, tid, z["key"], tags if tags_fit(tags) else [],
-                z["annotationComment"] if comment_fits(z["annotationComment"]) else ""))
+            bv = base_values(z, tid)        # the same comment and tags the base records
+            f.md = tine.md_append(f.md, tine.highlight_block(z["annotationText"], pg, color, tid, z["key"],
+                                                             bv["tags"], bv["comment"]))
 
     def tine_add(self, att, f, pdfdoc, zanns, sdoc, new_base, a):
+        was_there = a.tid in f.entries()
         self.add(f, pdfdoc, zanns[a.zkey], a.tid)
-        new_base[a.zkey]["undo"] = {"present": False}
+        if not was_there:
+            new_base[a.zkey]["undo"] = {"present": False}
 
     def tine_remove(self, att, f, pdfdoc, zanns, sdoc, new_base, a):
         entries, page = f.entries(), f.highlights()
@@ -521,6 +642,8 @@ class Sync:
             _, s, t = entries[a.tid]
             snap["edn"] = f.edn[s:t]
             f.edn = tine.edn_remove(f.edn, a.tid)
+            # Remember it for a while: a reader opened before this write may save it back (see plan_doc).
+            sdoc.setdefault("removed", {})[a.tid] = time.time() * 1000
         if h:
             snap["md"] = tine.md_subtree(f.md, a.tid)
             notes = [c for c in h.block.children if c is not h.cblock]
@@ -542,7 +665,6 @@ class Sync:
         if h.comment and h.comment != a.arg:
             backup(a.zkey, {"reason": "Tine comment overwritten from Zotero", "md": tine.md_subtree(f.md, a.tid)})
         f.md = tine.md_set_comment(f.md, a.tid, a.arg)
-
 
     def tine_conflict(self, att, f, pdfdoc, zanns, sdoc, new_base, a):
         f.md = tine.md_add_conflict(f.md, a.tid, a.arg, f"{datetime.now():%Y-%m-%d %H:%M}")
@@ -588,9 +710,10 @@ class Sync:
         if not self.z.patch(a.zkey, patch, version):
             raise ZoteroError(f"{a.zkey} changed in Zotero meanwhile (412)")
         cur = self.z.get(f"/items/{a.zkey}")[0]["data"]
-        tag_names = lambda tags: sorted(t["tag"] for t in tags)
-        # Once a 204 PATCH left new tags unset (not reproducible); only a verified write counts as synced.
-        if any(tag_names(cur[f]) != tag_names(v) if f == "tags" else cur[f] != v for f, v in patch.items()):
+        # Only a verified write counts as synced, compared the way Zotero stores values (trimmed, NFC).
+        stored = lambda v: (sorted(tine.zotero_str(t["tag"]) for t in v) if isinstance(v, list)
+                            else tine.zotero_str(v) if isinstance(v, str) else v)
+        if any(stored(cur[k]) != stored(v) for k, v in patch.items()):
             raise ZoteroError(f"{a.zkey}: PATCH returned 204 but Zotero does not show the new values")
         new_base[a.zkey]["version"] = cur["version"]
 
@@ -615,38 +738,74 @@ def cmd_init(graph, notes):
         raise SystemExit(f"{graph} is not a Tine graph (no logseq/config.edn)")
     APP.mkdir(parents=True, exist_ok=True)
     save_json(APP / "config.json", {"graph": str(graph), "notes_heading": notes})
-    if not (APP / "auth.json").exists():
-        print("Zotero will ask to allow write access for tine-zotero: click Allow.")
-        save_json(APP / "auth.json", authorize(), mode=0o600)
+    print("Zotero will ask to allow write access for tine-zotero: click Always Allow.")
+    save_json(APP / "auth.json", authorize(), mode=0o600)
     print(f"graph: {graph}\nstate: {APP}")
 
 
+_LOCK = None
+
+
+def hold_lock(graph):
+    """One writer per state folder: `tzb run`, a manual `tzb sync` and `tzb resume` would fight over the same files."""
+    global _LOCK
+    if _LOCK:
+        return
+    f = open(APP / "run.lock", "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        raise SystemExit(f"another tzb (the background service?) is syncing {graph} (lock: {APP / 'run.lock'})")
+    _LOCK = f
+
+
+_SAID = {}      # problems already logged: a persisting one is reported once, not every cycle
+
+
 def sync(dry_run=False):
-    """One cycle. Returns True if work is left for a later cycle (deferred, retried or waiting)."""
+    """One cycle. Returns None, or "soon"/"later" if work is left for a later cycle."""
     cfg = load_config()
     graph = Path(cfg["graph"])
+    if not dry_run:
+        hold_lock(graph)
     state = load_json(APP / "state.json", {"docs": {}})
     auth = load_json(APP / "auth.json", None)
     sid = server_id()
     if state.get("server_id", sid) != sid or (auth and auth["server_id"] != sid):
         raise SystemExit(f"Zotero server id changed ({state.get('server_id')} -> {sid}): refusing to sync")
     z = Zotero(auth)
-    pdfs, parents, by_att, skipped = read_zotero(z)
+    pdfs, by_att, skipped = read_zotero(z)
+    parents = parents_of(z, [a for a in pdfs if a["key"] not in state["docs"]])
     names = assign_names(pdfs, parents, state)
     opened = tine.open_pdfs(graph)
     now = time.time() * 1000
-    plans = []
+    run, plans, resume = Sync(graph, z, state, cfg), [], APP / "resume"
     for att in pdfs:
         name, sdoc = names[att["key"]], state["docs"].get(att["key"])
-        att["_path"] = sdoc["src"] if sdoc and os.path.exists(sdoc["src"]) else z.file_path(att["key"])
-        att["_size"] = os.stat(att["_path"]).st_size
+        try:
+            att["_path"] = sdoc["src"] if sdoc and os.path.exists(sdoc["src"]) else z.file_path(att["key"])
+            att["_size"] = os.stat(att["_path"]).st_size
+        except (OSError, ZoteroError) as ex:    # not downloaded ("as needed" file sync) or removed by hand
+            run.report(f"{name}: PDF is not on this Mac ({ex}); skipped")
+            continue
         att["_parent"] = parents.get(att.get("parentItem"), {})
-        plans.append((att, name, plan_doc(graph, att, name, by_att.get(att["key"], {}), sdoc,
-                                          opened.get(f"{name}.pdf", []), now)))
+        marker = resume / name
+        try:
+            plan = plan_doc(graph, att, name, by_att.get(att["key"], {}), sdoc, opened.get(f"{name}.pdf", []), now,
+                            marker.exists())
+        except Exception as ex:                 # e.g. an .edn that does not parse: this document only
+            run.report(f"{name}: cannot read its Tine files ({ex!r}); skipped")
+            continue
+        if marker.exists() and not dry_run:
+            marker.unlink()                     # `tzb resume` applies to one cycle only
+        plans.append((att, name, plan))
     for k in state["docs"].keys() - {a["key"] for a in pdfs}:
+        if z.exists(k):     # in the Zotero trash, or under a trashed paper: keep everything until it is emptied
+            continue
         name = state["docs"][k]["name"]
         gone = Action(name, "zotero_gone", note="PDF no longer in Zotero",
-                      deferred="PDF open in Tine" if f"{name}.pdf" in opened else "")
+                      deferred=PDF_OPEN if f"{name}.pdf" in opened else "")
         plans.append(({"key": k, "_path": None}, name, ([gone], {}, {})))
 
     actions = [a for _, _, (acts, _, _) in plans for a in acts]
@@ -658,91 +817,100 @@ def sync(dry_run=False):
         if new:
             print(f"\n{len(new)} new documents:", ", ".join(f"{a.doc}({a.note.split()[1]})" for a in new))
         print("totals:", dict(Counter(a.op for a in actions)))
+        for msg in run.problems:
+            print(msg)
         if skipped:
-            print("not synced (v0.1 handles highlights only):", dict(skipped))
-        return False
+            print("not synced (tzb handles highlights only):", dict(skipped))
+        return None
 
     state["server_id"] = sid
-    run = Sync(graph, z, state, cfg)
     for att, name, (acts, new_base, snap) in plans:
-        if att["_path"] is None:        # attachment gone from Zotero
-            if not acts[0].deferred:
+        try:
+            if att["_path"] is not None:
+                run.run_doc(att, name, by_att.get(att["key"], {}), acts, new_base, snap)
+            elif not acts[0].deferred:          # attachment gone from Zotero
                 f = Files(graph, name)
                 run.zotero_gone(att, f, None, {}, None, {}, acts[0])
                 f.save()
                 del state["docs"][att["key"]]
                 run.save_state()
                 log(acts[0])
-            continue
-        run.run_doc(att, name, by_att.get(att["key"], {}), acts, new_base, snap)
-    return run.retry or any(a.deferred for a in actions)
+        except Exception as ex:                 # one document's failure must not stop the others
+            run.report(f"{name}: sync failed ({ex!r})")
+            run.failed()
+    for msg, alert in run.problems.items():
+        if msg not in _SAID:
+            log(msg)
+            if alert:
+                notify(msg)
+    _SAID.clear()
+    _SAID.update(run.problems)
+    return run.retry
 
 
-SESSIONS = Path.home() / "Library/Application Support/page.tine.Tine/sessions"
-IDLE_S = 600                    # safety re-check when no file event arrives at all
-TROUBLE_S = 60                  # re-check while Zotero is closed or a cycle keeps failing (file events still wake us)
+IDLE_S = 60                     # re-check without an event: catches editors that save in place (Tine and iCloud
+                                # replace files, which wakes us at once); one fingerprint costs a few ms of CPU
+TROUBLE_S = 60                  # re-check while Zotero is closed or something keeps failing (file events still wake us)
 VNODE = select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
 
 
 def watched(graph, state):
-    """Files whose change can mean work: Tine pages, highlight stores and sessions, and Zotero's database.
-
-    Directories report added, removed and renamed entries (Tine and iCloud replace files atomically).
-    """
+    """What to wake up on: folders (Tine and iCloud replace files atomically, which changes the folder), Zotero's
+    database, Tine's session files, and the `tzb resume` markers. A few fds, whatever the library size."""
     src = next((d["src"] for d in state["docs"].values()), None)
     zdir = Path(src).parents[2] if src else Path.home() / "Zotero"      # <data dir>/storage/<KEY>/<file>
-    return [graph / "assets", graph / "pages", SESSIONS, zdir, zdir / "zotero.sqlite", zdir / "zotero.sqlite-wal",
-            *graph.glob("assets/*.edn"), *graph.glob("pages/hls__*.md"), *SESSIONS.glob(f"{graph.name}-*.json")]
+    return [graph / "assets", graph / "pages", tine.SESSIONS, zdir, APP / "resume",
+            zdir / "zotero.sqlite", zdir / "zotero.sqlite-wal", *tine.session_files(graph)]
 
 
 def fingerprint(graph):
-    """Cheap change detector: Zotero library version plus mtimes of the Tine files and Tine's session files."""
-    paths = [*graph.glob("assets/*.edn"), *graph.glob("pages/hls__*.md"), *SESSIONS.glob(f"{graph.name}-*.json")]
-    return Zotero().library_version(), sorted((str(p), p.stat().st_mtime) for p in paths if p.exists())
+    """Cheap change detector: Zotero library version, mtimes of the Tine files and sessions, pending resumes."""
+    paths = [*graph.glob("assets/*.edn"), *graph.glob("pages/hls__*.md"), *tine.session_files(graph)]
+    resume = APP / "resume"
+    return (Zotero().library_version(), sorted((str(p), p.stat().st_mtime) for p in paths if p.exists()),
+            sorted(os.listdir(resume)) if resume.exists() else [])
 
 
 def cmd_run():
     """Sleep in kqueue until a watched file changes; sync only when the fingerprint moved or work is pending."""
-    graph, last, pending, trouble = Path(load_config()["graph"]), None, True, None
-    lock = open(APP / "run.lock", "w")      # held for the life of the process
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:     # two daemons on one graph would fight over the same files
-        raise SystemExit(f"another `tzb run` already syncs {graph} (lock: {APP / 'run.lock'})")
+    graph, last, pending, trouble = Path(load_config()["graph"]), None, "soon", None
+    hold_lock(graph)
+    (APP / "resume").mkdir(parents=True, exist_ok=True)
     log(f"watching {graph}")
     while True:
         kq, fds = select.kqueue(), []
         for p in watched(graph, load_json(APP / "state.json", {"docs": {}})):      # armed before syncing: no gap
             try:
                 fds.append(os.open(p, os.O_EVTONLY))
-            except OSError:
+            except (FileNotFoundError, PermissionError):
                 continue
             kq.control([select.kevent(fds[-1], select.KQ_FILTER_VNODE, select.KQ_EV_ADD | select.KQ_EV_CLEAR, VNODE)], 0)
         try:
             fp = fingerprint(graph)
             if pending or fp != last:
-                pending = sync()
-                last = fingerprint(graph)
+                # The fingerprint from before the cycle: an edit that lands while it runs still differs next time.
+                pending, last = sync(), fp
             if trouble:
                 log("Zotero is back" if trouble == "offline" else "sync works again")
                 trouble = None
         # While Zotero is closed or a cycle keeps failing, report it once and wait for a file event (Zotero's
         # database changes as soon as it starts) or TROUBLE_S, instead of retrying and logging every 3 s.
-        except (urllib.error.URLError, ConnectionError) as ex:
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as ex:
             if trouble != "offline":
                 log(f"Zotero not reachable ({ex}); waiting for it")
-            trouble, pending, last = "offline", False, None
+            trouble, pending, last = "offline", None, None
         except SystemExit as ex:    # a refusal (e.g. another Zotero library): say so, retry on the next change
             if trouble != str(ex):
                 log(ex)
-            trouble, pending, last = str(ex), False, None
+            trouble, pending, last = str(ex), None, None
         except Exception:       # keep the daemon alive; the next cycle re-reads everything
             err = traceback.format_exc()
             if trouble != err:
                 log(err.rstrip())
-            trouble, pending, last = err, False, None
+            trouble, pending, last = err, None, None
+        wait = 3 if pending == "soon" else TROUBLE_S if pending or trouble else IDLE_S
         try:
-            if kq.control(None, 64, 3 if pending else TROUBLE_S if trouble else IDLE_S):
+            if kq.control(None, 64, wait):
                 time.sleep(0.3)         # let a burst of writes land before looking
         finally:
             kq.close()
@@ -779,14 +947,12 @@ def cmd_agent(install):
 
 
 def cmd_resume(name):
-    state = load_json(APP / "state.json", {"docs": {}})
-    for sdoc in state["docs"].values():
-        if sdoc["name"] == name:
-            sdoc["allow_mass_delete"] = True
-            save_json(APP / "state.json", state)
-            print(f"{name}: the next cycle applies the deletions")
-            return
-    raise SystemExit(f"unknown document {name}")
+    """Let the next cycle apply a paused document's deletions (a marker file, so no race with the running service)."""
+    if name not in {d["name"] for d in load_json(APP / "state.json", {"docs": {}})["docs"].values()}:
+        raise SystemExit(f"unknown document {name}")
+    (APP / "resume").mkdir(parents=True, exist_ok=True)
+    (APP / "resume" / name).touch()
+    print(f"{name}: the next cycle applies the deletions")
 
 
 def main():
